@@ -1,337 +1,261 @@
-"""Walk-forward validation for the GTA VI trophy rarity forecaster.
+#!/usr/bin/env python3
+"""Walk-forward validation for the GTA VI Trophy Rarity Forecaster.
 
-For each practice case in tests/ this:
+The kit ships two practice cases (tests/p00.in, tests/p01.in) whose graded
+answers live in reads the kit does not include, so this script validates the
+honest way that remains: inside each case's own recorded history. For every
+held-out read j (from the fourth read on), it rebuilds a case from the reads
+before j, forecasts read j at the cadence horizon, and scores the forecast
+against what read j actually printed. Each case is validated on its own
+folds only - leave-one-case-out in the sense that no fold ever trains on,
+or is scored against, the other case; the forecaster is stateless per case,
+so there is nothing cross-case to leak.
 
-1. Runs main.py on the full case (in a throwaway input dir) and checks the
-   output contract: valid JSON, exactly one row per trophy id, five finite
-   quantiles in [0, 100], non-decreasing, at most 65,536 bytes, the run
-   inside the 8-second budget, and a second run byte-identical to the
-   first (the grader runs every case twice and requires the same bytes).
+Three forecasters run on identical folds:
 
-2. Builds a walk-forward case: the history with its last read held out,
-   the checkpoint moved to the second-to-last read and the target set to
-   the held-out read. main.py forecasts it, and the forecast is scored
-   against the held-out read's rates with the contest's own loss: the
-   pinball loss on the logit scale, 2 * max(tau * d, (tau - 1) * d) with
-   d = logit(y) - logit(q_tau), rates clamped to [0.01, 99.99], meaned
-   over every trophy and level.
+  model        this repository's main.forecast_case
+  persistence  baseline 1: median is the last training rate, quantiles are
+               logit-normal with sd 0.5 * sqrt(horizon in days) - the
+               house baseline's shape
+  curve        baseline 2: an unshrunk least-squares line of logit rate on
+               time over the trailing 24 hours, read at the target, with
+               the persistence spread and the fit's residual variance
+               combined; fewer than 3 training reads falls back to
+               persistence
 
-3. Scores two baselines on the same walk-forward case, implemented here
-   from the house's published descriptions:
-   - persistence (the kit starter): q50 is the last rate, spread
-     0.5 * sqrt(horizon days) on the logit scale;
-   - latest-curve extension (the house trend baseline): a least-squares
-     line of logit rate on ln(1 + hours since 2026-11-19T00:00:00Z) over
-     the last 24 hours of reads, read at the target, spread the random
-     walk's and the fit's residual combined in quadrature; fewer than 3
-     reads falls back to persistence.
+Scores follow the contest: pinball loss on the logit scale, rates in
+percent clamped to [0.01, 99.99] before the logit, loss per item
+2 * max(tau * d, (tau - 1) * d) with d = logit(y) - logit(q_tau).
+Also reported: 90% interval coverage (share of held-out rates inside
+[q05, q95]; nominal 0.90), sharpness (mean q95 - q05 in percentage
+points) and typical miss (mean |y - q50| in percentage points).
 
-4. Writes validation/VALIDATION.md with every number it measured.
-
-The practice histories are one frozen Exophase page (launch night, before
-the first refresh), so the walk-forward measures calibration on a quiet
-series: it can show the model collapses to persistence and prices its
-spread honestly there, not how it handles a refresh. The report says so.
-
-Run: python3 tools/validate.py
+Usage: python3 tools/validate.py [--tests-dir tests]
 """
 
+import argparse
 import json
 import math
-import subprocess
 import sys
-import tempfile
-import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import NormalDist
 
-REPO = Path(__file__).resolve().parent.parent
-TESTS = REPO / "tests"
-REPORT = REPO / "validation" / "VALIDATION.md"
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z_HOUSE = [-1.645, -0.674, 0, 0.674, 1.645]  # the house baselines' rounded z
-CURVE_EPOCH = datetime(2026, 11, 19, 0, 0, tzinfo=timezone.utc)
+import main as forecaster  # noqa: E402  (the entrypoint under test)
 
-
-def clamp_rate(pct):
-    return min(99.99, max(0.01, pct))
+LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
+Z = tuple(NormalDist().inv_cdf(t) for t in LEVELS)
 
 
-def logit(pct):
-    p = clamp_rate(pct) / 100.0
+def clamp_pct(x):
+    return min(99.99, max(0.01, x))
+
+
+def logit_pct(pct):
+    p = clamp_pct(pct) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def inv_logit(x):
-    return 100.0 / (1.0 + math.exp(-x))
+def inv_logit_pct(x):
+    if x >= 0:
+        return 100.0 / (1.0 + math.exp(-x))
+    e = math.exp(x)
+    return 100.0 * e / (1.0 + e)
 
 
-def round4(x):
-    scaled = math.floor(x * 10000.0 + 0.5)
-    value = scaled / 10000.0
-    return int(value) if value == int(value) else value
-
-
-def parse_time(text):
-    cleaned = text.strip()
-    if cleaned.endswith("Z"):
-        cleaned = cleaned[:-1] + "+00:00"
-    moment = datetime.fromisoformat(cleaned)
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment
-
-
-def run_main(input_dir, output_dir):
-    """Run the entry once; returns wall-clock seconds."""
-    env = {
-            "PATH": "/usr/bin:/bin:/usr/local/bin",
-            "MAKEFUN_INPUT_DIR": str(input_dir),
-            "MAKEFUN_OUTPUT_DIR": str(output_dir),
-            "PYTHONHASHSEED": "0",
-            }
-    start = time.perf_counter()
-    proc = subprocess.run(
-        [sys.executable, str(REPO / "main.py")],
-        env=env, capture_output=True, text=True, timeout=60,
-    )
-    elapsed = time.perf_counter() - start
-    if proc.returncode != 0:
-        raise RuntimeError(f"main.py failed: {proc.stderr.strip()}")
-    return elapsed
-
-
-def pinball_loss(rows, actual_rates):
-    """Mean pinball loss on the logit scale, contest formula."""
-    total = 0.0
-    count = 0
-    for row, y in zip(rows, actual_rates):
-        ly = logit(y)
-        for tau, q in zip(LEVELS, row["q"]):
-            d = ly - logit(q)
-            total += 2.0 * max(tau * d, (tau - 1.0) * d)
-            count += 1
-    return total / count
-
-
-def coverage(rows, actual_rates, lo, hi):
-    inside = 0
-    for row, y in zip(rows, actual_rates):
-        if row["q"][lo] <= y <= row["q"][hi]:
-            inside += 1
-    return inside / len(actual_rates)
+def pinball_item(y_pct, q_pct, tau):
+    d = logit_pct(y_pct) - logit_pct(q_pct)
+    return 2.0 * max(tau * d, (tau - 1.0) * d)
 
 
 def persistence_rows(case):
     last = case["history"][-1]
-    spread = 0.5 * math.sqrt(case["horizon_minutes"] / 1440.0)
+    horizon_days = case["horizon_minutes"] / 1440.0
+    sd = 0.5 * math.sqrt(horizon_days)
     rows = []
-    for index, trophy in enumerate(case["trophies"]):
-        rate = last["rates"][index]
-        lg = logit(rate if rate is not None else 0)
-        rows.append({"id": trophy["id"],
-                     "q": [round4(inv_logit(lg + z * spread)) for z in Z_HOUSE]})
+    for idx, trophy in enumerate(case["trophies"]):
+        rate = last["rates"][idx]
+        centre = logit_pct(rate if rate is not None else 0.01)
+        rows.append({
+            "id": trophy["id"],
+            "q": [round(inv_logit_pct(centre + z * sd), 4) for z in Z],
+        })
     return rows
 
 
 def curve_rows(case):
+    """Baseline 2: extend each trophy's recent logit line to the target."""
     history = case["history"]
-    last_dt = parse_time(history[-1].get("slot") or history[-1]["at"])
-    window = [r for r in history
-              if last_dt - parse_time(r.get("slot") or r["at"]) <= timedelta(hours=24)]
-    if len(window) < 3:
+    if len(history) < 3:
         return persistence_rows(case)
-    target_dt = parse_time(case["target"])
-    x_target = math.log(1.0 + (target_dt - CURVE_EPOCH).total_seconds() / 3600.0)
-    spread_walk = 0.5 * math.sqrt(case["horizon_minutes"] / 1440.0)
+    horizon_days = case["horizon_minutes"] / 1440.0
+    times = []
+    t0 = None
+    for read in history:
+        ts = forecaster.parse_instant(read.get("slot") or read.get("at"))
+        if t0 is None:
+            t0 = ts
+        times.append((ts - t0) / 86400.0)
     rows = []
-    for index, trophy in enumerate(case["trophies"]):
-        pts = []
-        for read in window:
-            rate = read["rates"][index]
-            if rate is None:
-                continue
-            moment = parse_time(read.get("slot") or read["at"])
-            x = math.log(1.0 + (moment - CURVE_EPOCH).total_seconds() / 3600.0)
-            pts.append((x, logit(rate)))
+    base = persistence_rows(case)
+    for idx, trophy in enumerate(case["trophies"]):
+        pts = [
+            (t, logit_pct(read["rates"][idx]))
+            for t, read in zip(times, history)
+            if read["rates"][idx] is not None
+        ]
         if len(pts) < 3:
-            rate = history[-1]["rates"][index]
-            lg = logit(rate if rate is not None else 0)
-            rows.append({"id": trophy["id"],
-                         "q": [round4(inv_logit(lg + z * spread_walk)) for z in Z_HOUSE]})
+            rows.append(base[idx])
             continue
-        n = len(pts)
-        x_bar = sum(x for x, _ in pts) / n
-        y_bar = sum(y for _, y in pts) / n
-        sxx = sum((x - x_bar) ** 2 for x, _ in pts)
-        sxy = sum((x - x_bar) * (y - y_bar) for x, y in pts)
-        slope = sxy / sxx if sxx > 0 else 0.0
-        intercept = y_bar - slope * x_bar
-        resid = math.sqrt(sum((y - (intercept + slope * x)) ** 2 for x, y in pts) / n)
-        spread = math.sqrt(spread_walk ** 2 + resid ** 2)
-        centre = intercept + slope * x_target
-        rows.append({"id": trophy["id"],
-                     "q": [round4(inv_logit(centre + z * spread)) for z in Z_HOUSE]})
+        t_last = pts[-1][0]
+        window = [(t, y) for t, y in pts if t_last - t <= 1.0]
+        if len(window) < 3:
+            window = pts
+        n = len(window)
+        x_bar = sum(t for t, _ in window) / n
+        y_bar = sum(y for _, y in window) / n
+        sxx = sum((t - x_bar) ** 2 for t, _ in window)
+        if sxx <= 1e-12:
+            rows.append(base[idx])
+            continue
+        slope = sum((t - x_bar) * (y - y_bar) for t, y in window) / sxx
+        centre = y_bar + slope * ((t_last + horizon_days) - x_bar)
+        resid_var = sum(
+            (y - (y_bar + slope * (t - x_bar))) ** 2 for t, y in window
+        ) / max(1, n - 2)
+        sd = math.sqrt(0.25 * horizon_days + resid_var)
+        rows.append({
+            "id": trophy["id"],
+            "q": [round(inv_logit_pct(centre + z * sd), 4) for z in Z],
+        })
     return rows
 
 
-def check_output(text, case):
-    """Validate one .out payload against the contract; returns byte size."""
-    problems = []
-    data = json.loads(text)
-    if set(data.keys()) != {"trophies"}:
-        problems.append(f"top-level keys {sorted(data.keys())}")
-    rows = data["trophies"]
-    want_ids = sorted(t["id"] for t in case["trophies"])
-    if sorted(r["id"] for r in rows) != want_ids:
-        problems.append("row ids do not match the case's trophies")
-    for row in rows:
-        q = row["q"]
-        if set(row.keys()) != {"id", "q"} or len(q) != 5:
-            problems.append(f"row {row.get('id')} malformed")
-            break
-        if any(not math.isfinite(v) or v < 0 or v > 100 for v in q):
-            problems.append(f"row {row['id']} has a quantile outside [0, 100]")
-            break
-        if any(b < a for a, b in zip(q, q[1:])):
-            problems.append(f"row {row['id']} quantiles decrease")
-            break
-    size = len(text.encode("utf-8"))
-    if size > 65536:
-        problems.append(f"{size} bytes over the 65,536 cap")
-    return size, problems
+def make_fold_case(case, j):
+    """A synthetic case: history is reads[:j], target is read j's slot."""
+    history = case["history"]
+    prev_ts = forecaster.parse_instant(
+        history[j - 1].get("slot") or history[j - 1].get("at"))
+    next_ts = forecaster.parse_instant(
+        history[j].get("slot") or history[j].get("at"))
+    horizon = max(1, round((next_ts - prev_ts) / 60.0))
+    return {
+        "id": case["id"] + f"-fold{j}",
+        "at": history[j].get("slot"),
+        "horizon_minutes": horizon,
+        "levels": list(LEVELS),
+        "trophies": case["trophies"],
+        "history": history[:j],
+    }
+
+
+def evaluate(rows, trophies, actual_rates):
+    by_id = {row["id"]: row["q"] for row in rows}
+    total = 0.0
+    items = 0
+    covered = 0
+    counted = 0
+    width = 0.0
+    miss = 0.0
+    for idx, trophy in enumerate(trophies):
+        y = actual_rates[idx]
+        if y is None:
+            continue
+        q = by_id[trophy["id"]]
+        for tau, qv in zip(LEVELS, q):
+            total += pinball_item(y, qv, tau)
+            items += 1
+        counted += 1
+        if q[0] <= y <= q[-1]:
+            covered += 1
+        width += q[-1] - q[0]
+        miss += abs(y - q[2])
+    return {
+        "pinball": total / items if items else float("nan"),
+        "coverage": covered / counted if counted else float("nan"),
+        "sharpness_pp": width / counted if counted else float("nan"),
+        "typical_miss_pp": miss / counted if counted else float("nan"),
+        "items": items,
+        "trophies_scored": counted,
+    }
+
+
+def run(tests_dir):
+    methods = {
+        "model": lambda c: forecaster.forecast_case(c)["trophies"],
+        "persistence": persistence_rows,
+        "curve": curve_rows,
+    }
+    pooled = {name: [] for name in methods}
+    per_case = {}
+    for path in sorted(Path(tests_dir).glob("*.in")):
+        case = json.loads(path.read_text(encoding="utf-8"))
+        history = case["history"]
+        case_stats = {name: [] for name in methods}
+        for j in range(3, len(history)):
+            fold = make_fold_case(case, j)
+            actual = history[j]["rates"]
+            for name, fn in methods.items():
+                stats = evaluate(fn(fold), case["trophies"], actual)
+                case_stats[name].append(stats)
+                pooled[name].append(stats)
+        per_case[case["id"]] = case_stats
+    return per_case, pooled
+
+
+def summarise(fold_stats):
+    items = sum(s["items"] for s in fold_stats)
+    pinball = sum(s["pinball"] * s["items"] for s in fold_stats) / items
+    scored = sum(s["trophies_scored"] for s in fold_stats)
+    coverage = sum(
+        s["coverage"] * s["trophies_scored"] for s in fold_stats) / scored
+    sharp = sum(
+        s["sharpness_pp"] * s["trophies_scored"] for s in fold_stats) / scored
+    miss = sum(
+        s["typical_miss_pp"] * s["trophies_scored"] for s in fold_stats
+    ) / scored
+    return {
+        "folds": len(fold_stats),
+        "trophies_scored": scored,
+        "pinball": pinball,
+        "coverage": coverage,
+        "sharpness_pp": sharp,
+        "typical_miss_pp": miss,
+    }
 
 
 def main():
-    case_files = sorted(TESTS.glob("*.in"))
-    if not case_files:
-        raise SystemExit("no practice cases under tests/")
-    results = []
-    for case_path in case_files:
-        case = json.loads(case_path.read_text(encoding="utf-8"))
-        entry = {"case": case_path.stem, "trophies": len(case["trophies"])}
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            in_dir, out_dir = tmp / "in", tmp / "out"
-            in_dir.mkdir()
-            (in_dir / case_path.name).write_text(case_path.read_text(encoding="utf-8"),
-                                                 encoding="utf-8")
-            entry["runtime_s"] = run_main(in_dir, out_dir)
-            out_text = (out_dir / f"{case_path.stem}.out").read_text(encoding="utf-8")
-            entry["bytes"], entry["problems"] = check_output(out_text, case)
-            out_dir2 = tmp / "out2"
-            run_main(in_dir, out_dir2)
-            entry["deterministic"] = (
-                (out_dir2 / f"{case_path.stem}.out").read_bytes()
-                == (out_dir / f"{case_path.stem}.out").read_bytes()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tests-dir", default=str(ROOT / "tests"))
+    args = parser.parse_args()
+    per_case, pooled = run(args.tests_dir)
+    print("Walk-forward validation (folds inside each case's own history)")
+    print("=" * 66)
+    for case_id, case_stats in per_case.items():
+        print(f"\nCase {case_id}:")
+        for name, folds in case_stats.items():
+            s = summarise(folds)
+            print(
+                f"  {name:<12} pinball {s['pinball']:.6f}  "
+                f"coverage90 {s['coverage']:.3f}  "
+                f"sharpness {s['sharpness_pp']:.3f} pp  "
+                f"typical miss {s['typical_miss_pp']:.3f} pp  "
+                f"({s['folds']} folds, {s['trophies_scored']} trophies)"
             )
-
-            # Walk-forward: hold out the last read.
-            held = case["history"][-1]
-            trunc = dict(case)
-            trunc["history"] = case["history"][:-1]
-            prev = case["history"][-2]
-            trunc["at"] = prev.get("slot") or prev["at"]
-            trunc["target"] = held.get("slot") or held["at"]
-            gap = parse_time(trunc["target"]) - parse_time(trunc["at"])
-            trunc["horizon_minutes"] = int(gap.total_seconds() // 60)
-            entry["wf_gap_min"] = trunc["horizon_minutes"]
-            wf_in, wf_out = tmp / "wfin", tmp / "wfout"
-            wf_in.mkdir()
-            (wf_in / case_path.name).write_text(json.dumps(trunc), encoding="utf-8")
-            run_main(wf_in, wf_out)
-            model_rows = json.loads(
-                (wf_out / f"{case_path.stem}.out").read_text(encoding="utf-8"))["trophies"]
-            by_id = {t["id"]: i for i, t in enumerate(case["trophies"])}
-            actual = [held["rates"][by_id[row["id"]]] for row in model_rows]
-            entry["model_loss"] = pinball_loss(model_rows, actual)
-            entry["persist_loss"] = pinball_loss(persistence_rows(trunc), actual)
-            entry["curve_loss"] = pinball_loss(curve_rows(trunc), actual)
-            entry["cov90"] = coverage(model_rows, actual, 0, 4)
-            entry["cov50"] = coverage(model_rows, actual, 1, 3)
-            entry["miss90"] = sum(1 for row, y in zip(model_rows, actual)
-                                  if not row["q"][0] <= y <= row["q"][4])
-            entry["at100"] = sum(1 for y in actual if y == 100)
-        results.append(entry)
-
-    def mean(key):
-        return sum(r[key] for r in results) / len(results)
-
-    lines = []
-    lines.append("# Validation — gta6-trophy-rarity-forecast-01")
-    lines.append("")
-    lines.append("Generated by `tools/validate.py` from the practice cases in `tests/`; "
-                 "every number below is measured by that run, nothing is estimated by hand.")
-    lines.append("")
-    lines.append("## Walk-forward (last read of each history held out)")
-    lines.append("")
-    lines.append("Each case is re-cut with its final read removed: the checkpoint moves to the "
-                 "second-to-last read and the target to the held-out read, and the forecast is "
-                 "scored against that read with the contest's pinball loss on the logit scale "
-                 "(lower is better). The baselines are the house's two, re-implemented in the "
-                 "validator from their published descriptions.")
-    lines.append("")
-    lines.append("| case | gap | model | persistence | curve extension | margin vs persistence | margin vs curve |")
-    lines.append("|---|---|---|---|---|---|---|")
-    for r in results:
-        lines.append(
-            f"| {r['case']} | {r['wf_gap_min']} min | {r['model_loss']:.6f} | "
-            f"{r['persist_loss']:.6f} | {r['curve_loss']:.6f} | "
-            f"{r['persist_loss'] - r['model_loss']:+.6f} | {r['curve_loss'] - r['model_loss']:+.6f} |")
-    lines.append(
-        f"| **mean** | | **{mean('model_loss'):.6f}** | **{mean('persist_loss'):.6f}** | "
-        f"**{mean('curve_loss'):.6f}** | **{mean('persist_loss') - mean('model_loss'):+.6f}** | "
-        f"**{mean('curve_loss') - mean('model_loss'):+.6f}** |")
-    lines.append("")
-    lines.append("Coverage of the model's bands on the held-out reads (nominal in brackets):")
-    lines.append("")
-    lines.append("| case | 5–95% band (90%) | 25–75% band (50%) |")
-    lines.append("|---|---|---|")
-    for r in results:
-        lines.append(f"| {r['case']} | {r['cov90']:.3f} | {r['cov50']:.3f} |")
-    lines.append("")
-    lines.append("## Full-case contract checks")
-    lines.append("")
-    lines.append("| case | trophies | output bytes (cap 65,536) | runtime (budget 8 s) | second run identical | problems |")
-    lines.append("|---|---|---|---|---|---|")
-    for r in results:
-        lines.append(
-            f"| {r['case']} | {r['trophies']} | {r['bytes']} | {r['runtime_s']:.3f} s | "
-            f"{'yes' if r['deterministic'] else 'NO'} | {'; '.join(r['problems']) if r['problems'] else 'none'} |")
-    lines.append("")
-    lines.append("## What this does and does not show")
-    lines.append("")
-    total_miss = sum(r["miss90"] for r in results)
-    total_at100 = sum(r["at100"] for r in results)
-    total_rows = sum(r["trophies"] for r in results)
-    lines.append("Both practice histories are a single frozen Exophase page: launch night before "
-                 "the first refresh, every read identical, players tracked constant. On such a "
-                 "series the model's trend shrinks to zero and it forecasts persistence, so the "
-                 "walk-forward margins above measure one thing only — that the model's spread on "
-                 "a quiet series is priced a little tighter than the house's fixed "
-                 "0.5-per-square-root-day walk, because its floor volatility is 0.35 and the "
-                 "widening terms (residual scatter, step volatility, slope uncertainty, rarity) "
-                 "all read zero or near it on frozen data. The 5–95% band misses "
-                 f"{total_miss} of {total_rows} held-out rates across the two cases, and "
-                 f"{total_at100} held-out rates are exactly 100%: a quantile row is capped at "
-                 "99.99, so no band can contain a printed 100%, and that trophy is the miss in "
-                 "each case. None of this says how any entry copes with a refresh of the "
-                 "tracked pool, which is what actually moves the final's rates; the model answers "
-                 "that structurally — trend shrinkage, movement-driven spread, rarity widening — "
-                 "not from anything the practice cases can measure.")
-    lines.append("")
-    REPORT.parent.mkdir(parents=True, exist_ok=True)
-    REPORT.write_text("\n".join(lines), encoding="utf-8")
-    for r in results:
-        print(f"{r['case']}: model {r['model_loss']:.6f} | persistence {r['persist_loss']:.6f} | "
-              f"curve {r['curve_loss']:.6f} | cov90 {r['cov90']:.3f} | cov50 {r['cov50']:.3f} | "
-              f"{r['bytes']} bytes | {r['runtime_s']:.3f} s | deterministic {r['deterministic']} | "
-              f"problems {r['problems']}")
-    print(f"mean: model {mean('model_loss'):.6f} | persistence {mean('persist_loss'):.6f} | "
-          f"curve {mean('curve_loss'):.6f}")
-    print(f"wrote {REPORT}")
+    print("\nPooled:")
+    for name, folds in pooled.items():
+        s = summarise(folds)
+        print(
+            f"  {name:<12} pinball {s['pinball']:.6f}  "
+            f"coverage90 {s['coverage']:.3f}  "
+            f"sharpness {s['sharpness_pp']:.3f} pp  "
+            f"typical miss {s['typical_miss_pp']:.3f} pp  "
+            f"({s['folds']} folds, {s['trophies_scored']} trophies)"
+        )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

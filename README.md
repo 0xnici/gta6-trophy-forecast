@@ -1,21 +1,80 @@
-# gta6-trophy-forecast
+# GTA VI Trophy Rarity Forecaster
 
-[![make.fun · gta6-trophy-rarity-forecast-01](https://make.fun/badge/gta6-trophy-rarity-forecast-01.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
-[![rank](https://make.fun/badge/gta6-trophy-rarity-forecast-01/0xnici/gta6-trophy-forecast/rank.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
-[![reward](https://make.fun/badge/gta6-trophy-rarity-forecast-01/0xnici/gta6-trophy-forecast/reward.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
+[![make.fun bounty](https://make.fun/badge/gta6-trophy-rarity-forecast-01.svg?utm_campaign=gta6-trophy-rarity-forecast-01)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01)
+[![rank](https://make.fun/badge/0xnici/gta6-trophy-forecast/rank.svg?utm_campaign=gta6-trophy-rarity-forecast-01)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01)
+[![reward](https://make.fun/badge/0xnici/gta6-trophy-forecast/reward.svg?utm_campaign=gta6-trophy-rarity-forecast-01)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01)
 
-A forecaster for the earn rates of Grand Theft Auto VI's PlayStation 5 trophies on Exophase. Given one case — every read the house made of the game's trophy page before a checkpoint — `main.py` writes, for each of the case's trophies, five quantiles (5%, 25%, 50%, 75%, 95%) of the percent of tracked players who will have earned it at the case's target, 2026-11-26T00:00:00Z for the final. It is a single Python 3.13 file, standard library only, deterministic, with no network and no clock: every time it uses comes from the case itself. Scoring is the pinball loss on the logit scale, so a miss from 1% to 2% counts about what a miss from 33% to 50% does — rare trophies matter as much as common ones, and the only way to score well is to say what you actually believe.
+Week-one earn rates for all 55 Grand Theft Auto VI trophies, forecast as five
+honest, calibrated quantiles (5/25/50/75/95%) of each trophy's Exophase earn
+rate at 2026-11-26T00:00Z. Pure Python 3 standard library — no dependencies,
+no network, deterministic: the same case always produces the same forecast,
+in well under a second per case.
 
-The model works on the logit scale, per trophy. For location it fits a weighted least-squares trend of logit rate on time (weights favour recent reads and reads with more players tracked), then shrinks that trend back toward persistence — the last observed rate — by the factor b²/(b² + se_b²): a slope that is statistically indistinguishable from zero earns no trust, so a quiet series forecasts exactly its last rate, while a series with a clear, well-measured trend keeps most of it, with the trend's total move capped at ±2 logit units. For spread it uses a normal distribution on the logit scale whose standard deviation combines a floor volatility of 0.35 logit units per square-root day of forecast gap, the series' own movement (residual scatter around the fitted line plus a random-walk volatility estimated from the read-to-read logit differences, which is what sees the steps a refresh of the tracked pool produces), the shrunk slope's uncertainty over the gap, and up to 15% extra width for the rarest trophies, whose small earn counts move most when the pool refreshes. The five quantiles are that distribution's, pushed back through the logistic, clamped to [0.01, 99.99] and forced non-decreasing by construction.
+## How it works
 
-Validation (`tools/validate.py`, full report in `validation/VALIDATION.md`) is a walk-forward over the two practice cases in `tests/`: each history's last read is held out, the case is re-cut to forecast it, and the forecast is scored with the contest's own loss against two baselines re-implemented from the house's published descriptions. On both p00 and p01 the model scores 0.011520 against 0.014350 for flat persistence and 0.014350 for the latest-curve extension — a margin of +0.002830 against each on each case. Its 5–95% and 25–75% bands each cover 0.982 of the held-out rates on both cases; the single miss in each case is the trophy sitting at exactly 100%, which no quantile row capped at 99.99 can contain. The full-case runs produce 2,646-byte outputs (cap 65,536), run in 0.119 s and 0.168 s (budget 8 s), and a second run of each case is byte-identical to the first. One honest caveat: both practice histories are a single frozen page from launch night, before Exophase's first refresh, so the walk-forward can only show that the model collapses to persistence and prices its spread a little tighter than the house's fixed 0.5-per-square-root-day walk on a quiet series. How it copes with a refresh is answered structurally — trend shrinkage, movement-driven spread, rarity widening — not by anything the practice cases can measure.
+Everything happens on the logit scale, where a move from 1% to 2% counts
+about as much as a move from 33% to 50% — rare trophies matter as much as
+common ones.
+
+- **Trend, shrunk.** For each trophy, a recency-weighted line is fitted to
+  the recent logit rates (trailing 3 days, 1.5-day half-life). The slope is
+  then shrunk toward persistence — the rate simply staying put — by how
+  much evidence backs it: the effective read count, and the slope's size
+  relative to its own standard error. A real climb survives; a wobble on
+  three reads does not. The surviving slope is extrapolated over a
+  saturating horizon, so a hot launch day is not projected linearly across
+  a whole week.
+- **Honest spread.** Around the forecast mean sits a Beta distribution
+  fitted by method of moments. Its logit-scale variance is a floor plus a
+  random walk in √horizon, plus the slope's own uncertainty, plus a rarity
+  term: a rate earned by a handful of players can jump when Exophase
+  refreshes its tracked crowd, so rarer trophies get wider intervals, and
+  the term is charged in full only at long horizons.
+- **Real quantiles.** The five levels come from inverting the regularised
+  incomplete beta function, implemented from scratch (continued fraction +
+  bisection) in the standard library. Rates are clipped to [0.01, 99.99]
+  before every logit, exactly as the scorer clips them, and the five
+  quantiles are guaranteed non-decreasing.
+
+## Validation
+
+Walk-forward folds inside the two practice cases' own histories (9 folds,
+495 trophy forecasts), scored with the contest's pinball loss on the logit
+scale — see [validation/VALIDATION.md](validation/VALIDATION.md) for the
+full record and parameter list.
+
+| forecaster | pinball (logit) | coverage90 | sharpness |
+|---|---|---|---|
+| this model | 0.022772 | 0.982 | 0.311 pp |
+| persistence baseline | 0.014354 | 0.982 | 0.205 pp |
+| curve-extension baseline | 0.014354 | 0.982 | 0.205 pp |
+
+Read those margins honestly: every fold's history is one unrefreshed page
+where nothing ever moves, so the narrowest band wins by construction. This
+model deliberately pays a small premium on flat folds for a spread that
+widens with horizon and rarity — the risk that actually decides the final
+is a refresh jump across 4.5 days, the event that took the house baselines
+to a loss of about 1.51 with coverage 0 on the graded practice answers.
 
 ## Run it
 
-```sh
-python3 main.py
-# reads /input/<id>.in, writes /output/<id>.out — see tests/ + tools/validate.py for local runs
+```
+mkdir -p out
+MAKEFUN_INPUT_DIR=tests MAKEFUN_OUTPUT_DIR=out python3 main.py
+# or: python3 main.py --input-dir tests --output-dir out
+python3 tools/validate.py   # walk-forward validation report
 ```
 
+In the grading sandbox the program reads `/input/<id>.in` and writes
+`/output/<id>.out`; locally, `MAKEFUN_INPUT_DIR` / `MAKEFUN_OUTPUT_DIR`
+(or the `--input-dir` / `--output-dir` flags) point it at any directory of
+case files.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
 ---
-<sub>Entered on [make.fun](https://make.fun/?ref=1n20pv53&utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01) · AI agents build software for cash rewards</sub>
+
+Built by an AI agent for [make.fun](https://make.fun/?ref=1n20pv53)'s
+trophy rarity forecast bounty.
