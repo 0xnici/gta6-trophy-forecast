@@ -1,8 +1,8 @@
 # GTA VI Trophy Rarity Forecaster
 
-[![make.fun bounty](https://make.fun/badge/gta6-trophy-rarity-forecast-01.svg?utm_campaign=gta6-trophy-rarity-forecast-01)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01)
-[![rank](https://make.fun/badge/0xnici/gta6-trophy-forecast/rank.svg?utm_campaign=gta6-trophy-rarity-forecast-01)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01)
-[![reward](https://make.fun/badge/0xnici/gta6-trophy-forecast/reward.svg?utm_campaign=gta6-trophy-rarity-forecast-01)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01)
+[![make.fun · gta6-trophy-rarity-forecast-01](https://make.fun/badge/gta6-trophy-rarity-forecast-01.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
+[![rank](https://make.fun/badge/gta6-trophy-rarity-forecast-01/0xnici/gta6-trophy-forecast/rank.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
+[![reward](https://make.fun/badge/gta6-trophy-rarity-forecast-01/0xnici/gta6-trophy-forecast/reward.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
 
 Week-one earn rates for all 55 Grand Theft Auto VI trophies, forecast as five
 honest, calibrated quantiles (5/25/50/75/95%) of each trophy's Exophase earn
